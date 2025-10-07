@@ -1,0 +1,7 @@
+streamlit
+pandas
+chromadb
+langchain
+langchain-openai
+langchain-anthropic
+langchain-community
