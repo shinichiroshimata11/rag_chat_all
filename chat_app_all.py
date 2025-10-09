@@ -3,7 +3,7 @@
 """
 Streamlit RAG Chatbot for all brands.
 Uses Chroma vectorstore + OpenAI embeddings + Anthropic Claude for answers.
-Cloud-safe version: stores index under /tmp and uses duckdb+parquet backend.
+Cloud-safe version: stores index under /tmp and reuses Chroma instance safely.
 """
 
 import os
@@ -50,23 +50,28 @@ PROMPT = PromptTemplate(
 )
 
 # -------------------------------------------------------------
-# Retriever
+# Cache Chroma to avoid re-initialization conflicts
 # -------------------------------------------------------------
-def load_retriever(index_dir: Path, k: int = 4, brand_filter: str | None = None):
+@st.cache_resource(show_spinner=False)
+def get_vectorstore(index_dir: Path):
+    """Initialize and cache Chroma client safely."""
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
     client_settings = Settings(
         is_persistent=True,
         persist_directory=str(index_dir),
         anonymized_telemetry=False,
     )
-
-    vs = Chroma(
+    return Chroma(
         persist_directory=str(index_dir),
         embedding_function=embeddings,
         client_settings=client_settings,
     )
 
+# -------------------------------------------------------------
+# Retriever
+# -------------------------------------------------------------
+def load_retriever(index_dir: Path, k: int = 4, brand_filter: str | None = None):
+    vs = get_vectorstore(index_dir)
     if brand_filter and brand_filter != "All":
         return vs.as_retriever(search_kwargs={"k": k, "filter": {"brand": brand_filter}})
     return vs.as_retriever(search_kwargs={"k": k})
