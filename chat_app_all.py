@@ -1,165 +1,146 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Streamlit RAG Chatbot for all brands.
-Uses Chroma vectorstore + OpenAI embeddings + Anthropic Claude for answers.
-Cloud-safe version: stores index under /tmp and reuses Chroma instance safely.
+Streamlit RAG Chatbot for Support Logs
+- Uses OpenAI embeddings + Anthropic Claude for answers
+- Stores vectors in Chroma (duckdb+parquet backend)
+- Auto-builds index if not found
 """
 
+# -------------------- Environment Setup --------------------
 import os
-import sys
-import subprocess
+os.environ["CHROMA_DB_IMPL"] = "duckdb+parquet"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from pathlib import Path
+import subprocess
+import sys
 import pandas as pd
 import streamlit as st
 
+from chromadb.config import Settings
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langchain_anthropic import ChatAnthropic
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-from chromadb.config import Settings
 
-# -------------------------------------------------------------
-# Environment defaults (safe for Streamlit Cloud)
-# -------------------------------------------------------------
-os.environ.setdefault("CHROMA_DB_IMPL", "duckdb+parquet")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# -------------------- Paths --------------------
 INDEX_DIR = Path(os.getenv("INDEX_DIR", "/tmp/index_all"))
-CSV_PATH = Path(os.getenv("CSV_PATH", "./all_brands_support_log_embedding_ready.csv"))
+CSV_PATH  = Path(os.getenv("CSV_PATH", "./all_brands_support_log_embedding_ready.csv"))
 
-# -------------------------------------------------------------
-# Prompt Template
-# -------------------------------------------------------------
-PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template=(
-        "You are a bilingual (Japanese/English) support engineer. "
-        "Answer ONLY using the information in the context below.\n"
-        "If the answer cannot be found, say so and request escalation.\n\n"
-        "Rules:\n"
-        "- Include the source **brand name** in your answer.\n"
-        "- Use numbered steps when appropriate.\n"
-        "- Add notes for risks/version differences.\n"
-        "- End with citations listing (brand, qa_id, resolved_at, ticket_number).\n\n"
-        "—— Context ——\n{context}\n—— End Context ——\n\n"
-        "Question: {question}\n"
-        "Answer:"
-    ),
+
+# -------------------- Global Chroma Settings --------------------
+DEFAULT_CLIENT_SETTINGS = Settings(
+    chroma_db_impl="duckdb+parquet",
+    persist_directory=str(INDEX_DIR),
+    anonymized_telemetry=False,
 )
 
-# -------------------------------------------------------------
-# Cache Chroma to avoid re-initialization conflicts
-# -------------------------------------------------------------
+
+# -------------------- Cached Vector Store --------------------
 @st.cache_resource(show_spinner=False)
-def get_vectorstore(index_dir: Path):
-    """Initialize and cache Chroma client safely."""
+def get_vectorstore() -> Chroma:
+    """Initialize and cache Chroma instance safely."""
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    client_settings = Settings(
-        is_persistent=True,
-        persist_directory=str(index_dir),
-        anonymized_telemetry=False,
-    )
     return Chroma(
-        persist_directory=str(index_dir),
+        persist_directory=str(INDEX_DIR),
         embedding_function=embeddings,
-        client_settings=client_settings,
+        client_settings=DEFAULT_CLIENT_SETTINGS,
     )
 
-# -------------------------------------------------------------
-# Retriever
-# -------------------------------------------------------------
-def load_retriever(index_dir: Path, k: int = 4, brand_filter: str | None = None):
-    vs = get_vectorstore(index_dir)
+
+# -------------------- Retriever Loader --------------------
+def load_retriever(k: int = 4, brand_filter: str | None = None):
+    vs = get_vectorstore()
     if brand_filter and brand_filter != "All":
         return vs.as_retriever(search_kwargs={"k": k, "filter": {"brand": brand_filter}})
     return vs.as_retriever(search_kwargs={"k": k})
 
-# -------------------------------------------------------------
-# Main App
-# -------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="All-brands RAG Chat", layout="wide")
-    st.title("All-brands RAG Chat (Claude + Chroma)")
 
-    index_dir = INDEX_DIR
-
-    # Auto-build if missing
-    if not index_dir.exists():
-        if not CSV_PATH.exists():
-            st.error(f"CSV not found at {CSV_PATH}. Upload or commit it.")
-            st.stop()
-
+# -------------------- Helper: Build Index --------------------
+def build_index_if_missing():
+    """Auto-runs index_all.py if the index folder doesn't exist."""
+    if not INDEX_DIR.exists():
         st.warning("Index not found. Building it now — please wait a few minutes...")
-        with st.spinner("Creating embeddings & building Chroma index..."):
-            build_env = {**os.environ, "INDEX_DIR": str(index_dir), "CSV_PATH": str(CSV_PATH)}
-            proc = subprocess.run(
-                [sys.executable, "index_all.py", "--csv", str(CSV_PATH), "--out", str(index_dir)],
-                capture_output=True,
-                text=True,
-                env=build_env,
-            )
-        if proc.returncode != 0:
-            st.error("Index build failed.\n\nSTDERR:\n" + proc.stderr + "\n\nSTDOUT:\n" + proc.stdout)
-            st.stop()
+        build_env = os.environ.copy()
+        build_env["INDEX_DIR"] = str(INDEX_DIR)
+        build_env["CSV_PATH"] = str(CSV_PATH)
 
-    # Brand list
-    brands = ["All"]
-    if CSV_PATH.exists():
-        try:
-            df = pd.read_csv(CSV_PATH, usecols=["brand"])
-            brands += sorted([b for b in df["brand"].dropna().unique() if str(b).strip()])
-        except Exception:
-            pass
+        result = subprocess.run(
+            [sys.executable, "index_all.py", "--csv", str(CSV_PATH), "--out", str(INDEX_DIR)],
+            capture_output=True,
+            text=True,
+            env=build_env,
+        )
+        if result.returncode != 0:
+            st.error(f"Index build failed.\n\nSTDERR:\n{result.stderr}\n\nSTDOUT:\n{result.stdout}")
+            st.stop()
+        else:
+            st.success("Index built successfully! You can now chat.")
+
+
+# -------------------- Chat Function --------------------
+def run_chat(question: str, retriever, model="claude-3-5-sonnet-20240620", temperature=0.1):
+    docs = retriever.get_relevant_documents(question)
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = PromptTemplate.from_template("""
+You are a support engineer analyzing QA logs.
+Use the context below to answer clearly and concisely.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:
+""")
+
+    llm = ChatAnthropic(model=model, temperature=temperature)
+    chain = LLMChain(prompt=prompt, llm=llm)
+    return chain.run(context=context, question=question)
+
+
+# -------------------- Streamlit App --------------------
+def main():
+    st.set_page_config(page_title="All-Brands Support Log Chat", layout="wide")
+    st.title("🧠 All-Brands RAG Chatbot")
+    st.caption("Search and summarize support logs across multiple brands.")
+
+    # Secrets validation
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        st.error("❌ Missing Anthropic API key. Set `ANTHROPIC_API_KEY` in Streamlit Secrets.")
+        st.stop()
+    if not os.getenv("OPENAI_API_KEY"):
+        st.error("❌ Missing OpenAI API key. Set `OPENAI_API_KEY` in Streamlit Secrets.")
+        st.stop()
+
+    # Index check
+    build_index_if_missing()
 
     # Sidebar controls
-    brand = st.sidebar.selectbox("Brand filter", options=brands, index=0)
-    topk = st.sidebar.slider("Top-K documents", 2, 12, 5)
-    temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
-    model = st.sidebar.selectbox(
-        "Claude model",
-        ["claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022", "claude-3-haiku-20240307"],
-        index=0,
-    )
+    with st.sidebar:
+        st.header("🔧 Settings")
+        topk = st.slider("Results per query (k)", 2, 10, 4)
+        brand = st.selectbox("Brand filter", ["All", "LeCreuset", "Herno", "Moncler"])
+        st.markdown("---")
+        st.caption("Data source: all_brands_support_log_embedding_ready.csv")
 
-    retriever = load_retriever(index_dir, k=topk, brand_filter=brand)
-    llm = ChatAnthropic(model=model, temperature=temperature)
+    # Input + response area
+    user_q = st.text_input("Ask a question about support logs:")
+    if st.button("Search", type="primary"):
+        if not user_q.strip():
+            st.warning("Please enter a question first.")
+        else:
+            retriever = load_retriever(k=topk, brand_filter=brand)
+            with st.spinner("Thinking..."):
+                answer = run_chat(user_q, retriever)
+                st.markdown("### 💬 Answer")
+                st.write(answer)
 
-    query = st.text_input("Ask a question")
 
-    if st.button("Ask") and query.strip():
-        with st.spinner("Searching and composing…"):
-            candidates = retriever.get_relevant_documents(query)
-
-            st.subheader("Evidence")
-            for i, d in enumerate(candidates, 1):
-                m = d.metadata
-                st.markdown(
-                    f"- **{i}.** brand={m.get('brand','')}, qa_id={m.get('qa_id','')}, "
-                    f"resolved_at={m.get('resolved_at','')}, ticket={m.get('ticket_number','')}"
-                )
-
-            context = "\n\n---\n\n".join(
-                [
-                    f"Brand: {d.metadata.get('brand','')}\nqa_id: {d.metadata.get('qa_id','')}\n"
-                    f"resolved_at: {d.metadata.get('resolved_at','')}\nticket_number: {d.metadata.get('ticket_number','')}\n"
-                    f"CONTENT:\n{d.page_content}"
-                    for d in candidates
-                ]
-            )
-
-            llm_chain = LLMChain(llm=llm, prompt=PROMPT)
-            answer = llm_chain.run(context=context, question=query)
-
-        st.subheader("Answer")
-        st.write(answer)
-
-    st.markdown("---")
-    st.caption("Tip: choose 'All' for cross-brand search, or select one brand to narrow results.")
-
-# -------------------------------------------------------------
 if __name__ == "__main__":
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise RuntimeError("Please set ANTHROPIC_API_KEY first.")
     main()
