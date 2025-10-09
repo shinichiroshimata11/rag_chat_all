@@ -22,7 +22,7 @@ from langchain.chains import LLMChain
 # -------------------------------------------------------------
 # Paths (Cloud-safe)
 # -------------------------------------------------------------
-INDEX_DIR = Path(os.getenv("INDEX_DIR", "/mount/tmp/index_all"))  # Writable temp dir on Streamlit Cloud
+INDEX_DIR = Path(os.getenv("INDEX_DIR", "/tmp/index_all"))  # /tmp is writable on Streamlit Cloud
 CSV_PATH = Path(os.getenv("CSV_PATH", "./all_brands_support_log_embedding_ready.csv"))
 
 # -------------------------------------------------------------
