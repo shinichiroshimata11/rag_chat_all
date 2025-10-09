@@ -1,17 +1,10 @@
 streamlit==1.38.0
 pandas==2.2.2
 
-# LangChain stack (versions that work well on Py 3.11)
 langchain==0.2.16
 langchain-community==0.2.16
 langchain-openai==0.1.23
 langchain-anthropic==0.1.23
 
-# Vector DB
 qdrant-client==1.9.2
-
-# Tokenizer (wheels exist for Py 3.11)
 tiktoken==0.7.0
-
-# Chroma *only if* you still need it in scripts; otherwise you can remove this
-chromadb==0.5.5
