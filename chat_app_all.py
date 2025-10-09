@@ -1,160 +1,163 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Streamlit RAG Chatbot (FAISS version)
-- OpenAI embeddings (for indexing/search)
-- FAISS vector store (no Chroma, no pydantic v1)
-- Anthropic Claude for answers
-- Auto-builds FAISS index in /tmp if missing
+Streamlit RAG Chat (Qdrant + OpenAI embeddings + Claude).
+- Searches Qdrant with optional brand filter.
+- Shows evidence with brand/qa_id/resolved_at/ticket.
+- Answers via Anthropic Claude (bilingual JA/EN).
+
+Env (Streamlit Secrets suggested):
+  OPENAI_API_KEY
+  ANTHROPIC_API_KEY
+  QDRANT_URL
+  QDRANT_API_KEY
+  QDRANT_COLLECTION (optional, default: support_logs_all)
+  CSV_PATH (optional for listing brands locally)
 """
 
 import os
 from pathlib import Path
-import sys
-import subprocess
 import pandas as pd
 import streamlit as st
 
+from qdrant_client import QdrantClient
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain_anthropic import ChatAnthropic
 from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+from langchain.chains import RetrievalQA
+from langchain_community.vectorstores import Qdrant as LcQdrant
 
-# Paths (Cloud-safe defaults)
-INDEX_DIR = Path(os.getenv("INDEX_DIR", "/tmp/index_all_faiss"))
-CSV_PATH  = Path(os.getenv("CSV_PATH", "./all_brands_support_log_embedding_ready.csv"))
-
+# ---------------- Prompt ----------------
 PROMPT = PromptTemplate(
     input_variables=["context", "question"],
     template=(
-        "You are a bilingual (Japanese/English) support engineer. "
-        "Answer ONLY using the information in the context below.\n"
-        "If the answer cannot be found, say so and request escalation.\n\n"
+        "You are a bilingual (JA/EN) support engineer. Answer ONLY using the context below.\n"
+        "If you don't know, say so and request escalation.\n\n"
         "Rules:\n"
-        "- Include the source **brand name** in your answer.\n"
+        "- Include the source **brand name**.\n"
         "- Use numbered steps when appropriate.\n"
         "- Add notes for risks/version differences.\n"
         "- End with citations listing (brand, qa_id, resolved_at, ticket_number).\n\n"
         "—— Context ——\n{context}\n—— End Context ——\n\n"
         "Question: {question}\n"
         "Answer:"
-    ),
+    )
 )
 
-@st.cache_resource(show_spinner=False)
-def load_faiss() -> FAISS:
-    """Load FAISS index from disk (cached across reruns)."""
+def get_qdrant_client() -> QdrantClient:
+    url = os.getenv("QDRANT_URL")
+    key = os.getenv("QDRANT_API_KEY")
+    if not url or not key:
+        raise RuntimeError("Please set QDRANT_URL and QDRANT_API_KEY.")
+    return QdrantClient(url=url, api_key=key)
+
+def load_retriever(collection: str, k: int, brand_filter: str | None):
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    # allow_dangerous_deserialization=True is required by langchain FAISS loader
-    return FAISS.load_local(
-        str(INDEX_DIR),
-        embeddings,
-        allow_dangerous_deserialization=True
+    client = get_qdrant_client()
+
+    vs = LcQdrant(
+        client=client,
+        collection_name=collection,
+        embeddings=embeddings,
     )
 
-def build_index_if_missing():
-    """Build FAISS index in /tmp if it doesn't exist."""
-    if not INDEX_DIR.exists():
-        if not CSV_PATH.exists():
-            st.error(f"CSV not found at {CSV_PATH}. Upload/commit it.")
-            st.stop()
-        st.warning("Index not found. Building it now — this may take a few minutes...")
-        with st.spinner("Creating embeddings & building FAISS index..."):
-            env = os.environ.copy()
-            env["INDEX_DIR"] = str(INDEX_DIR)
-            env["CSV_PATH"] = str(CSV_PATH)
-            proc = subprocess.run(
-                [sys.executable, "index_all.py", "--csv", str(CSV_PATH), "--out", str(INDEX_DIR)],
-                capture_output=True, text=True, env=env
-            )
-        if proc.returncode != 0:
-            st.error("Index build failed.\n\nSTDERR:\n" + proc.stderr + "\n\nSTDOUT:\n" + proc.stdout)
-            st.stop()
+    # Qdrant filter syntax via LangChain:
+    if brand_filter and brand_filter != "All":
+        filt = {"must": [{"key": "brand", "match": {"value": brand_filter}}]}
+        return vs.as_retriever(search_kwargs={"k": k, "filter": filt})
+    return vs.as_retriever(search_kwargs={"k": k})
 
 def main():
-    st.set_page_config(page_title="All-brands RAG Chat (FAISS)", layout="wide")
-    st.title("All-brands RAG Chat (Claude + FAISS)")
-
-    # Secrets check
     if not os.getenv("OPENAI_API_KEY"):
-        st.error("❌ Missing OPENAI_API_KEY (for embeddings). Add it to Streamlit secrets.")
-        st.stop()
+        raise RuntimeError("Please set OPENAI_API_KEY.")
     if not os.getenv("ANTHROPIC_API_KEY"):
-        st.error("❌ Missing ANTHROPIC_API_KEY (for answers). Add it to Streamlit secrets.")
-        st.stop()
+        raise RuntimeError("Please set ANTHROPIC_API_KEY.")
 
-    # Build index if needed
-    build_index_if_missing()
+    st.set_page_config(page_title="All-brands RAG Chat (Qdrant)", layout="wide")
+    st.title("All-brands RAG Chat (Qdrant + Claude)")
 
-    # Brand list for filter (optional)
-    brands = ["All"]
-    try:
-        df = pd.read_csv(CSV_PATH, usecols=["brand"])
-        brands += sorted([b for b in df["brand"].dropna().unique() if str(b).strip()])
-    except Exception:
-        pass
+    qdrant_collection = os.getenv("QDRANT_COLLECTION", "support_logs_all")
 
     # Sidebar controls
-    brand = st.sidebar.selectbox("Brand filter", options=brands, index=0)
-    topk = st.sidebar.slider("Top-K documents", 2, 12, 5)
+    topk = st.sidebar.slider("Top-K documents", min_value=2, max_value=12, value=5, step=1)
     temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
+    # Use models you verified as available for your Anthropic account
     model = st.sidebar.selectbox(
         "Claude model",
-        ["claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022", "claude-3-haiku-20240307"],
+        ["claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"],
         index=0,
     )
 
-    # Load FAISS retriever (cached)
-    faiss_store = load_faiss()
+    # Brand list from CSV (local, for UI only)
+    brands = ["All"]
+    csv_path = Path(os.getenv("CSV_PATH", "./all_brands_support_log_embedding_ready.csv"))
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path, usecols=["brand"])
+            bset = sorted([b for b in df["brand"].dropna().unique() if str(b).strip()])
+            brands += bset
+        except Exception:
+            pass
 
-    # NOTE: FAISS doesn't support metadata filters internally.
-    # We filter results post-retrieval when brand != "All".
-    def retrieve(query: str):
-        docs = faiss_store.similarity_search(query, k=max(12, topk))  # overfetch
-        if brand != "All":
-            docs = [d for d in docs if (d.metadata or {}).get("brand") == brand]
-        return docs[:topk]
+    brand = st.sidebar.selectbox("Brand filter", options=brands, index=0)
 
-    # UI
+    # Buttons to check/initialize data
+    col_a, col_b = st.sidebar.columns(2)
+    with col_a:
+        if st.button("Count Points"):
+            try:
+                client = get_qdrant_client()
+                coll_info = client.get_collection(qdrant_collection)
+                st.success(f"Collection '{qdrant_collection}' is present.")
+            except Exception as e:
+                st.error(f"Qdrant error: {e}")
+
+    with col_b:
+        if st.button("Build Index"):
+            # Run index_all.py inside the same process (simple trigger)
+            import subprocess, sys
+            st.info("Building index…this may take a few minutes.")
+            env = os.environ.copy()
+            proc = subprocess.run([sys.executable, "index_all.py"], capture_output=True, text=True)
+            if proc.returncode == 0:
+                st.success("Index build finished.")
+            else:
+                st.error("Index build failed.")
+                st.code(proc.stdout)
+                st.code(proc.stderr)
+
+    # Build retriever + chain
+    retriever = load_retriever(qdrant_collection, k=topk, brand_filter=brand)
+    llm = ChatAnthropic(model=model, temperature=temperature)
+
+    chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": PROMPT},
+    )
+
     query = st.text_input("Ask a question")
     if st.button("Ask") and query.strip():
         with st.spinner("Searching and composing…"):
-            candidates = retrieve(query)
-
+            # show candidates first
+            candidates = retriever.get_relevant_documents(query)
             st.subheader("Evidence")
             for i, d in enumerate(candidates, 1):
                 m = d.metadata or {}
                 st.markdown(
-                    f"- **{i}.** brand={m.get('brand','')}, qa_id={m.get('qa_id','')}, "
-                    f"resolved_at={m.get('resolved_at','')}, ticket={m.get('ticket_number','')}"
+                    f"- **{i}.** brand={m.get('brand','')}, "
+                    f"qa_id={m.get('qa_id','')}, "
+                    f"resolved_at={m.get('resolved_at','')}, "
+                    f"ticket={m.get('ticket_number','')}"
                 )
-
-            context = "\n\n---\n\n".join(
-                [
-                    f"Brand: { (d.metadata or {}).get('brand','') }\n"
-                    f"qa_id: { (d.metadata or {}).get('qa_id','') }\n"
-                    f"resolved_at: { (d.metadata or {}).get('resolved_at','') }\n"
-                    f"ticket_number: { (d.metadata or {}).get('ticket_number','') }\n"
-                    f"CONTENT:\n{d.page_content}"
-                    for d in candidates
-                ]
-            )
-
-            llm = ChatAnthropic(model=model, temperature=temperature)
-            chain = LLMChain(llm=llm, prompt=PROMPT)
-            answer = chain.run(context=context, question=query)
+            answer = chain.run(query)
 
         st.subheader("Answer")
         st.write(answer)
 
     st.markdown("---")
-    with st.sidebar.expander("Debug"):
-        st.write("INDEX_DIR", str(INDEX_DIR), "exists:", INDEX_DIR.exists())
-        st.write("CSV_PATH", str(CSV_PATH), "exists:", CSV_PATH.exists())
-        st.write("OPENAI_API_KEY set:", bool(os.getenv("OPENAI_API_KEY")))
-        st.write("ANTHROPIC_API_KEY set:", bool(os.getenv("ANTHROPIC_API_KEY")))
+    st.caption("Tip: choose 'All' for cross-brand search, or pick a single brand to restrict retrieval.")
 
 if __name__ == "__main__":
     main()

@@ -1,157 +1,126 @@
-Your app is in the oven
-
-[     UTC     ] Logs for ragchatall-5iwbkeysi9a5of94n34rps.streamlit.app/
-
-────────────────────────────────────────────────────────────────────────────────────────
-
-[05:56:52] 🖥 Provisioning machine...
-
-[05:56:52] 🎛 Preparing system...
-
-[05:56:52] ⛓ Spinning up manager process...
-
-[05:52:51] 🚀 Starting up repository: 'rag_chat_all', branch: 'main', main module: 'chat_app_all.py'
-
-[05:52:51] 🐙 Cloning repository...
-
-[05:52:52] 🐙 Cloning into '/mount/src/rag_chat_all'...
-
-[05:52:52] 🐙 Cloned repository!
-
-[05:52:52] 🐙 Pulling code changes from Github...
-
-[05:52:53] 📦 Processing dependencies...
-
-
-──────────────────────────────────────── uv ───────────────────────────────────────────
-
-
-Using uv pip install.
-
-Using Python 3.13.8 environment at /home/adminuser/venv
-
-  × No solution found when resolving dependencies:
-
-  ╰─▶ Because langchain-core>=0.2.35,<=0.2.43 depends on pydantic>=2.7.4 and
-
-      only the following versions of langchain-core are available:
-
-          langchain-core<=0.2.35
-
-          langchain-core==0.2.36
-
-          langchain-core==0.2.37
-
-          langchain-core==0.2.38
-
-          langchain-core==0.2.39
-
-          langchain-core==0.2.40
-
-          langchain-core==0.2.41
-
-          langchain-core==0.2.42
-
-          langchain-core==0.2.43
-
-          langchain-core>0.3.0
-
-      we can conclude that langchain-core>=0.2.35,<0.3.0 depends on
-
-      pydantic>=2.7.4.
-
-      And because only the following versions of pydantic are available:
-
-          pydantic<=2.7.4
-
-          pydantic>=2.8.0,<=2.8.2
-
-          pydantic>=2.9.0,<=2.9.2
-
-          pydantic>=2.10.0,<=2.10.6
-
-          pydantic>=2.11.0,<=2.11.10
-
-          pydantic>=2.12.0
-
-      and langchain-openai==0.1.23 depends on langchain-core>=0.2.35,<0.3.0,
-
-      we can conclude that langchain-openai==0.1.23 depends on one of:
-
-          pydantic==2.7.4
-
-          pydantic>=2.8.0,<=2.8.2
-
-          pydantic>=2.9.0,<=2.9.2
-
-          pydantic>=2.10.0,<=2.10.6
-
-          pydantic>=2.11.0,<=2.11.10
-
-          pydantic>=2.12.0
-
-
-      And because you require langchain-openai==0.1.23 and pydantic==1.10.13,
-
-      we can conclude that your requirements are unsatisfiable.
-
-Checking if Streamlit is installed
-
-Installing rich for an improved exception logging
-
-Using uv pip install.
-
-Using Python 3.13.8 environment at /home/adminuser/venv
-
-Resolved 4 packages in 89ms
-
-Prepared 4 packages in 115ms
-
-Installed 4 packages in 13ms
-
- + markdown-it-py==4.0.0
-
- + mdurl==[2025-10-09 05:52:55.343910] 0.1.2
-
- + pygments==2.19.2
-
- + rich==14.1.0
-
-
-────────────────────────────────────────────────────────────────────────────────────────
-
-
-
-──────────────────────────────────────── pip ───────────────────────────────────────────
-
-
-Using standard pip install.
-
-Collecting streamlit==1.38.0 (from -r /mount/src/rag_chat_all/requirements.txt (line 1))
-
-  Downloading streamlit-1.38.0-py2.py3-none-any.whl.metadata (8.5 kB)
-
-Collecting pandas==2.2.2 (from -r /mount/src/rag_chat_all/requirements.txt (line 2))
-
-  Downloading pandas-2.2.2.tar.gz (4.4 MB)
-
-     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.4/4.4 MB 61.5 MB/s eta 0:00:00[2025-10-09 05:52:56.605963] 
-
-  Installing build dependencies: started
-
-  Installing build dependencies: finished with status 'done'
-
-  Getting requirements to build wheel: started
-
-  Getting requirements to build wheel: finished with status 'done'
-
-  Installing backend dependencies: started
-
-  Installing backend dependencies: finished with status 'done'
-
-  Preparing metadata (pyproject.toml): started
-
-main
-shinichiroshimata11/rag_chat_all/main/chat_app_all.py
-
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Build Qdrant index from your merged CSV.
+
+Env vars:
+  CSV_PATH                (default: ./all_brands_support_log_embedding_ready.csv)
+  QDRANT_URL              (required, e.g. https://YOUR-CLUSTER.cloud.qdrant.io)
+  QDRANT_API_KEY          (required)
+  QDRANT_COLLECTION       (default: support_logs_all)
+  OPENAI_API_KEY          (required for embeddings)
+
+Run locally:
+  python index_all.py
+"""
+
+import os
+import math
+import uuid
+import pandas as pd
+from pathlib import Path
+from typing import List, Dict, Any
+
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import VectorParams, Distance, PointStruct
+from langchain_openai import OpenAIEmbeddings
+
+CSV_PATH = Path(os.getenv("CSV_PATH", "./all_brands_support_log_embedding_ready.csv"))
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "support_logs_all")
+
+EMBED_MODEL = "text-embedding-3-small"  # 1536-dim
+
+def load_rows(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    # Normalize expected columns
+    for col in ["question", "answer", "brand", "qa_id", "resolved_at", "ticket_number"]:
+        if col not in df.columns:
+            df[col] = ""
+    # Derive a 'text' field if missing
+    if "text" not in df.columns:
+        df["text"] = df.apply(
+            lambda r: f"Brand: {str(r['brand']).strip()}\nQA_ID: {str(r['qa_id']).strip()}\nResolved: {str(r['resolved_at']).strip()}\nTicket: {str(r['ticket_number']).strip()}\n\nQ: {str(r['question']).strip()}\nA: {str(r['answer']).strip()}",
+            axis=1,
+        )
+    # Drop empty texts
+    df["text"] = df["text"].astype(str).apply(lambda s: s.strip())
+    df = df[df["text"] != ""].copy()
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+def main():
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        raise RuntimeError("Please set QDRANT_URL and QDRANT_API_KEY for Qdrant.")
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Please set OPENAI_API_KEY for embeddings.")
+
+    print(f"Loading: {CSV_PATH}")
+    df = load_rows(CSV_PATH)
+    print(f"Rows: {len(df)}")
+
+    # Create client and collection
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+    print(f"Preparing collection: {QDRANT_COLLECTION}")
+    # Recreate or create-if-missing
+    try:
+        client.get_collection(QDRANT_COLLECTION)
+        # If exists, we keep it and upsert (safe)
+        print("Collection exists. Upserting new points…")
+    except Exception:
+        print("Collection not found. Creating…")
+        client.recreate_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+        )
+
+    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+
+    texts: List[str] = df["text"].tolist()
+    print("Computing embeddings… (batching)")
+    # Batch to avoid timeouts
+    batch_size = 256
+    num_batches = math.ceil(len(texts) / batch_size)
+    inserted = 0
+
+    for b in range(num_batches):
+        s = b * batch_size
+        e = min((b + 1) * batch_size, len(texts))
+        batch_texts = texts[s:e]
+
+        vecs = embeddings.embed_documents(batch_texts)
+
+        points = []
+        for i, v in enumerate(vecs):
+            row = df.iloc[s + i]
+            payload: Dict[str, Any] = {
+                "text": row["text"],
+                "brand": str(row["brand"]).strip(),
+                "qa_id": str(row["qa_id"]).strip(),
+                "resolved_at": str(row["resolved_at"]).strip(),
+                "ticket_number": str(row["ticket_number"]).strip(),
+                "question": str(row["question"]).strip(),
+                "answer": str(row["answer"]).strip(),
+            }
+            points.append(
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=v,
+                    payload=payload,
+                )
+            )
+
+        client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+        inserted += len(points)
+        print(f"Upserted {inserted}/{len(texts)}")
+
+    print("Done.")
+
+if __name__ == "__main__":
+    main()

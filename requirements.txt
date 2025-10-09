@@ -2,7 +2,6 @@ streamlit==1.38.0
 pandas==2.2.2
 numpy==1.26.4
 
-# LangChain (pydantic v2 line)
 langchain==0.2.10
 langchain-community==0.2.10
 langchain-openai==0.1.23
@@ -11,6 +10,5 @@ langchain-anthropic==0.1.20
 openai>=1.40.0
 anthropic>=0.30.0
 
-# Vector store: FAISS (no Chroma, no Rust)
-faiss-cpu==1.7.4
-tiktoken
+qdrant-client==1.9.2
+tiktoken==0.7.0
