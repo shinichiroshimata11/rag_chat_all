@@ -58,6 +58,7 @@ def collect_metadata(doc) -> Dict[str, Any]:
     # 1) まず doc.metadata 自体
     if hasattr(doc, "metadata") and isinstance(doc.metadata, dict):
         md.update(_flatten_dict(doc.metadata))
+
         # 2) よくあるネスト候補を順に統合
         for k in ("payload", "qdrant__payload", "document", "metadata", "data"):
             if k in doc.metadata and isinstance(doc.metadata[k], dict):
@@ -79,7 +80,7 @@ def collect_metadata(doc) -> Dict[str, Any]:
 def doc_text(doc) -> str:
     """
     本文テキストを安全に抽出。
-    優先: doc.page_content -> payload.page_content/text/answer -> question+answer -> "".
+    優先: doc.page_content -> payload.page_content -> payload.answer -> "".
     """
     # 1) page_content が入っていれば最優先
     if getattr(doc, "page_content", None):
@@ -225,7 +226,6 @@ QDRANT_COLLECTION   = {qcol}
         st.error(f"検索中にエラーが発生しました。\n\n{e}")
         return
 
-    # page_content が空のものは除外（安全策）
     usable = [d for d in candidates if doc_text(d)]
     if not usable:
         st.warning("該当ドキュメントが見つかりません。")
@@ -239,10 +239,14 @@ QDRANT_COLLECTION   = {qcol}
     for i, d in enumerate(usable, 1):
         md_all = collect_metadata(d)
 
-        brand = meta_get(md_all, ["brand"])
-        qa_id = meta_get(md_all, ["qa_id"])
-        resolved = meta_get(md_all, ["resolved_at", "resolvedAt"])
-        ticket = meta_get(md_all, ["ticket_number", "ticket"])
+        brand = meta_get(md_all, ("brand",))
+        qa_id = meta_get(md_all, ("qa_id", "qaid", "qaId"))
+        resolved = meta_get(md_all, ("resolved_at", "resolvedAt", "date", "resolved"))
+        ticket = meta_get(md_all, ("ticket_number", "ticket", "ticket_no"))
+
+        # ここで N/A にならないように、question/answer から推測補完も可能（必要なら有効化）
+        # if brand == "N/A" and md_all.get("question"):
+        #     brand = "不明ブランド"
 
         citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
 
@@ -250,8 +254,8 @@ QDRANT_COLLECTION   = {qcol}
         with st.expander(f"スニペット {i}", expanded=False):
             st.write(doc_text(d))
             if show_debug:
-                st.caption("↓ メタデータ（実際の構造）")
-                st.json(d.metadata)
+                st.caption("↓ メタデータ（フラット化後）")
+                st.json(md_all)
 
         context_blocks.append(
             f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
