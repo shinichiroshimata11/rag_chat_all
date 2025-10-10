@@ -237,29 +237,32 @@ QDRANT_COLLECTION   = {qcol}
     context_blocks: List[str] = []
 
     for i, d in enumerate(usable, 1):
-        md_all = collect_metadata(d)
+    # ✅ Extract metadata directly from payload first (Qdrant format)
+    md_all = {}
+    if hasattr(d, "metadata") and isinstance(d.metadata, dict):
+        md_all.update(d.metadata.get("payload", {}))  # Qdrant payload
+        md_all.update(d.metadata)  # fallback (in case keys exist at top-level)
 
-        brand = meta_get(md_all, ("brand",))
-        qa_id = meta_get(md_all, ("qa_id", "qaid", "qaId"))
-        resolved = meta_get(md_all, ("resolved_at", "resolvedAt", "date", "resolved"))
-        ticket = meta_get(md_all, ("ticket_number", "ticket", "ticket_no"))
+    # ✅ Extract values with safe defaults
+    brand = md_all.get("brand", "N/A")
+    qa_id = md_all.get("qa_id", "N/A")
+    resolved = md_all.get("resolved_at", "N/A")
+    ticket = md_all.get("ticket_number", "N/A")
 
-        # ここで N/A にならないように、question/answer から推測補完も可能（必要なら有効化）
-        # if brand == "N/A" and md_all.get("question"):
-        #     brand = "不明ブランド"
+    citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
 
-        citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
+    # ✅ Display
+    st.markdown(f"**{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
+    with st.expander(f"スニペット {i}", expanded=False):
+        st.write(doc_text(d))
+        if show_debug:
+            st.caption("↓ メタデータ（実際の構造）")
+            st.json(d.metadata)
 
-        st.markdown(f"**{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
-        with st.expander(f"スニペット {i}", expanded=False):
-            st.write(doc_text(d))
-            if show_debug:
-                st.caption("↓ メタデータ（フラット化後）")
-                st.json(md_all)
+    context_blocks.append(
+        f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
+    )
 
-        context_blocks.append(
-            f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
-        )
 
     context = "\n\n---\n\n".join(context_blocks)
     citations_text = "\n".join(citations)
