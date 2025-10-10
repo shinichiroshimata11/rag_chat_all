@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+One-time loader: send CSV rows to Qdrant as documents with metadata.
+Usage (local):
+  set OPENAI_API_KEY, QDRANT_URL, QDRANT_API_KEY
+  python upload_to_qdrant.py --csv ./all_brands_support_log_embedding_ready.csv --collection support_logs_all
+"""
+
+import argparse
+import os
+import uuid
+import pandas as pd
+from tqdm import tqdm
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
+from langchain_openai import OpenAIEmbeddings
+
+def ensure_collection(client: QdrantClient, name: str, dim: int = 1536):
+    try:
+        client.get_collection(name)
+    except Exception:
+        client.recreate_collection(
+            collection_name=name,
+            vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+        )
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--collection", required=True)
+    ap.add_argument("--batch", type=int, default=128)
+    args = ap.parse_args()
+
+    qdrant_url = os.environ["QDRANT_URL"]
+    qdrant_key = os.environ["QDRANT_API_KEY"]
+
+    # text-embedding-3-small -> 1536 dims
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    df = pd.read_csv(args.csv)
+    # Expect columns: text, brand, qa_id, resolved_at, ticket_number
+    needed = {"text", "brand", "qa_id", "resolved_at", "ticket_number"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing columns: {missing}")
+
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_key)
+    ensure_collection(client, args.collection, dim=1536)
+
+    texts = df["text"].fillna("").astype(str).tolist()
+    metas = []
+    for _, r in df.iterrows():
+        metas.append({
+            "brand": str(r.get("brand", "")),
+            "qa_id": str(r.get("qa_id", "")),
+            "resolved_at": str(r.get("resolved_at", "")),
+            "ticket_number": str(r.get("ticket_number", "")),
+        })
+
+    ids = [str(uuid.uuid4()) for _ in texts]
+
+    # Embed and upload in batches
+    for i in tqdm(range(0, len(texts), args.batch), desc="Upserting to Qdrant"):
+        chunk_texts = texts[i:i+args.batch]
+        chunk_meta  = metas[i:i+args.batch]
+        chunk_ids   = ids[i:i+args.batch]
+
+        vecs = embeddings.embed_documents(chunk_texts)
+
+        client.upsert(
+            collection_name=args.collection,
+            points=[
+                qm.PointStruct(id=pid, vector=v, payload={"text": t, **m})
+                for pid, v, t, m in zip(chunk_ids, vecs, chunk_texts, chunk_meta)
+            ],
+        )
+
+    info = client.get_collection(args.collection)
+    print("Done. Collection status:", info.status)
+
+if __name__ == "__main__":
+    main()
