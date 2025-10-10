@@ -41,6 +41,14 @@ def mget(md: Dict[str, Any], key: str, default: str = "") -> str:
     return default if v is None else str(v)
 
 
+def meta_get(md: dict, keys: list[str], default="N/A") -> str:
+    """複数キー候補から値を取得"""
+    for k in keys:
+        if md.get(k):
+            return str(md[k])
+    return default
+
+
 def render_health(client: QdrantClient, collection: str):
     try:
         info = client.get_collection(collection)
@@ -50,10 +58,6 @@ def render_health(client: QdrantClient, collection: str):
 
 
 def fetch_brand_options(client: QdrantClient, collection: str, max_scan: int = 300) -> List[str]:
-    """
-    Qdrantには集計APIがないため、scrollで先頭 max_scan 件を覗いてブランド候補を作る。
-    コストを抑えるため取り過ぎない設計。
-    """
     uniq: Set[str] = set()
     next_offset = None
     remaining = max_scan
@@ -99,7 +103,7 @@ def main():
     st.set_page_config(page_title="全ブランドRAGサポート", page_icon="💬", layout="wide")
     st.title("全ブランド サポートRAG 💬")
 
-    # サイドバー（環境変数プレビュー & ヘルスチェック）
+    # サイドバー
     with st.sidebar:
         st.markdown("### 🔧 接続ヘルスチェック")
         oa = os.getenv("OPENAI_API_KEY", "")
@@ -117,7 +121,7 @@ QDRANT_COLLECTION   = {qcol}
             language="bash",
         )
 
-    # 必須環境変数
+    # 環境変数取得
     openai_key = need_env("OPENAI_API_KEY")
     anthropic_key = need_env("ANTHROPIC_API_KEY")
     qdrant_url = need_env("QDRANT_URL")
@@ -128,38 +132,33 @@ QDRANT_COLLECTION   = {qcol}
     qclient = QdrantClient(url=qdrant_url, api_key=qdrant_key)
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai_key)
 
-    # VectorStore（content_payload_key=page_content 前提）
     vectordb = QdrantVS(client=qclient, collection_name=collection, embeddings=embeddings)
     retriever = vectordb.as_retriever(search_kwargs={"k": 5})
 
     with st.sidebar:
         render_health(qclient, collection)
 
-    # ========= オプション&ブランド絞り込み =========
+    # オプション
     with st.expander("オプション / Options", expanded=True):
-        # ブランド候補の取得（軽量スキャン）
         brand_options = ["（すべて）"] + fetch_brand_options(qclient, collection, max_scan=300)
-        sel_brand = st.selectbox("ブランドで絞り込み", brand_options, index=0, help="Qdrantのpayload.brandでフィルタします")
-        k = st.slider("Top-K（取得件数）", 1, 10, 5, help="上位何件の類似ドキュメントを使うか")
-        temperature = st.slider("温度（多様性）", 0.0, 1.0, 0.2, 0.1, help="数値が高いほど出力が多様になります")
+        sel_brand = st.selectbox("ブランドで絞り込み", brand_options, index=0)
+        k = st.slider("Top-K（取得件数）", 1, 10, 5)
+        temperature = st.slider("温度（多様性）", 0.0, 1.0, 0.2, 0.1)
 
-    # フィルタ設定（選択された場合のみ）
     if sel_brand and sel_brand != "（すべて）":
         retriever.search_kwargs["filter"] = Filter(
             must=[FieldCondition(key="brand", match=MatchValue(value=sel_brand))]
         )
     else:
-        # 既存のfilterが残らないよう明示削除
         retriever.search_kwargs.pop("filter", None)
 
-    # ========= 入力＆実行 =========
-    query = st.text_input("質問", placeholder="例: Cegidがフリーズした時の対処は？ / What to do when Cegid freezes?")
+    query = st.text_input("質問", placeholder="例: Cegidがフリーズした時の対処は？")
     ask = st.button("実行（Ask）")
 
     if not ask or not query.strip():
         return
 
-    # 取得
+    # ドキュメント取得
     try:
         retriever.search_kwargs["k"] = k
         candidates = retriever.get_relevant_documents(query)
@@ -169,31 +168,33 @@ QDRANT_COLLECTION   = {qcol}
 
     usable = [d for d in candidates if doc_text(d)]
     if not usable:
-        st.warning("該当ドキュメントが見つかりませんでした。条件（ブランド/Top-K）を調整して再試行してください。")
+        st.warning("該当ドキュメントが見つかりません。")
         return
 
-    # 証拠（Evidence）
+    # ========= エビデンス =========
     st.markdown("### エビデンス（Evidence）")
+    citations = []
+    context_blocks = []
+
     for i, d in enumerate(usable, 1):
-        brand = mget(d.metadata, "brand", "N/A")
-        qa_id = mget(d.metadata, "qa_id", "N/A")
-        resolved = mget(d.metadata, "resolved_at", "N/A")
-        ticket = mget(d.metadata, "ticket_number", "N/A")
-        st.write(f"{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}")
+        md = d.metadata or {}
+        brand = meta_get(md, ["brand"])
+        qa_id = meta_get(md, ["qa_id", "qaid", "qaId"])
+        resolved = meta_get(md, ["resolved_at", "resolvedAt", "date", "resolved"])
+        ticket = meta_get(md, ["ticket_number", "ticket", "ticket_no"])
+
+        citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
+
+        st.markdown(f"**{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
         with st.expander(f"スニペット {i}", expanded=False):
             st.write(doc_text(d))
 
-    # コンテキストを生成
-    context_blocks = []
-    for d in usable:
-        brand = mget(d.metadata, "brand")
-        qa_id = mget(d.metadata, "qa_id")
-        resolved = mget(d.metadata, "resolved_at")
-        ticket = mget(d.metadata, "ticket_number")
         context_blocks.append(
             f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
         )
+
     context = "\n\n---\n\n".join(context_blocks)
+    citations_text = "\n".join(citations)
 
     # モデル
     llm = ChatAnthropic(model="claude-3-5-haiku-20241022", temperature=temperature, api_key=anthropic_key)
@@ -204,6 +205,9 @@ QDRANT_COLLECTION   = {qcol}
 
     st.markdown("### 回答（Answer）")
     st.write(answer)
+
+    st.markdown("### 引用（Citations）")
+    st.text(citations_text)
 
 
 if __name__ == "__main__":
