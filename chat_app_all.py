@@ -1,277 +1,358 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-All-Brands RAG Chatbot (Qdrant + OpenAI embeddings + Anthropic)
-- 日本語UI
-- ブランド絞り込みドロップダウン
-- 頑健なメタデータ抽出（brand / qa_id / resolved_at / ticket_number）
+Streamlit RAG Chatbot (Qdrant + OpenAI Embeddings + Anthropic Claude)
+
+- Brand filter (auto-fetched from Qdrant)
+- JP/EN UI toggle (Japanese default)
+- Top-K and Temperature controls
+- Evidence + proper citations from Qdrant payload
 """
 
+from __future__ import annotations
+
 import os
-from typing import Any, Dict, Iterable, List, Set
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
+import pandas as pd
+
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+from langchain_community.vectorstores import Qdrant as LCQdrant
 from langchain_openai import OpenAIEmbeddings
 from langchain_anthropic import ChatAnthropic
 from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain_community.vectorstores import Qdrant as QdrantVS
-from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from langchain_core.documents import Document
 
 
-# -------------------- helpers --------------------
-def need_env(var: str) -> str:
-    val = os.getenv(var)
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def getenv_or_fail(name: str) -> str:
+    val = os.getenv(name, "").strip()
     if not val:
-        raise RuntimeError(f"{var} が設定されていません（環境変数）。")
+        raise RuntimeError(f"Please set {name} in the environment.")
     return val
 
 
-def _flatten_dict(d: Dict[str, Any], depth: int = 2) -> Dict[str, Any]:
+def get_payload(doc: Document) -> Dict[str, Any]:
     """
-    小さい深さでネスト辞書を平坦化する。キー衝突は上書きOK。
-    例: {'payload': {...}, 'qdrant__payload': {...}} を一つにまとめる。
+    Qdrant (via langchain_community.vectorstores.qdrant) returns Documents with:
+      doc.page_content -> str | None
+      doc.metadata -> {'payload': {...}}  OR sometimes flat dict
+    This normalizes to a simple dict.
     """
-    out: Dict[str, Any] = {}
-    if not isinstance(d, dict):
-        return out
-    stack: List[tuple[Dict[str, Any], int]] = [(d, 0)]
-    while stack:
-        cur, lvl = stack.pop()
-        for k, v in cur.items():
-            if isinstance(v, dict) and lvl < depth:
-                stack.append((v, lvl + 1))
-            else:
-                if v is not None:
-                    out[k] = v
-    return out
+    meta = doc.metadata or {}
+    payload = meta.get("payload", meta)
+    if not isinstance(payload, dict):
+        payload = {}
+    return payload
 
 
-def collect_metadata(doc) -> Dict[str, Any]:
+def doc_text(doc: Document) -> str:
     """
-    LangChainのDocument.metadataの中に、実際のQdrant payloadが
-    いろいろなキーで入る場合に対応（'payload', 'qdrant__payload', 'document' など）。
+    Ensure we always have some content to show the user & model.
+    Priority:
+      1) doc.page_content
+      2) payload['answer'] + payload['question'] if available
+      3) join all str payload values as last resort
     """
-    md: Dict[str, Any] = {}
+    if doc.page_content:
+        return str(doc.page_content)
 
-    # 1) まず doc.metadata 自体
-    if hasattr(doc, "metadata") and isinstance(doc.metadata, dict):
-        md.update(_flatten_dict(doc.metadata))
-        # 2) よくあるネスト候補を順に統合
-        for k in ("payload", "qdrant__payload", "document", "metadata", "data"):
-            if k in doc.metadata and isinstance(doc.metadata[k], dict):
-                md.update(_flatten_dict(doc.metadata[k]))
+    p = get_payload(doc)
+    qa = []
+    if p.get("question"):
+        qa.append(f"Q: {p.get('question')}")
+    if p.get("answer"):
+        qa.append(f"A: {p.get('answer')}")
+    if qa:
+        return "\n".join(qa)
 
-    # 3) 念のため doc.dict() 内も見る（実装差異への保険）
-    try:
-        as_dict = getattr(doc, "dict", None)
-        if callable(as_dict):
-            d_all = doc.dict()
-            if "metadata" in d_all and isinstance(d_all["metadata"], dict):
-                md.update(_flatten_dict(d_all["metadata"]))
-    except Exception:
-        pass
-
-    return md
-
-
-def doc_text(doc) -> str:
-    """
-    本文テキストを安全に抽出。
-    優先: doc.page_content -> payload.page_content/text/answer -> question+answer -> "".
-    """
-    # 1) page_content が入っていれば最優先
-    if getattr(doc, "page_content", None):
-        return doc.page_content
-
-    # 2) メタデータから拾う
-    md = collect_metadata(doc)
-    for key in ("page_content", "text", "answer", "content", "body"):
-        if md.get(key):
-            return str(md[key])
-
-    # 3) 最後の保険：question + answer の連結（両方あれば）
-    q = md.get("question")
-    a = md.get("answer")
-    if q or a:
-        return f"Q: {q or ''}\nA: {a or ''}".strip()
-
-    return ""
+    # Fallback: join any string-like payload values
+    parts = []
+    for k, v in p.items():
+        try:
+            sv = str(v)
+        except Exception:
+            continue
+        if sv and sv.lower() not in ("none", "nan", "null"):
+            parts.append(f"{k}={sv}")
+    return "\n".join(parts) if parts else ""
 
 
-def meta_get(md: Dict[str, Any], candidates: Iterable[str], default: str = "N/A") -> str:
-    for k in candidates:
-        v = md.get(k)
-        if v not in (None, "", "null", "None"):
-            return str(v)
-    return default
-
-
-def render_health(client: QdrantClient, collection: str):
-    try:
-        info = client.get_collection(collection)
-        st.success(f"Qdrant接続OK：コレクション **{collection}**（status: {info.status}）")
-    except Exception as e:
-        st.error(f"Qdrant接続/コレクション確認に失敗: {e}")
-
-
-def fetch_brand_options(client: QdrantClient, collection: str, max_scan: int = 300) -> List[str]:
-    uniq: Set[str] = set()
-    next_offset = None
-    remaining = max_scan
-    while remaining > 0:
-        limit = min(100, remaining)
-        points, next_offset = client.scroll(
-            collection_name=collection,
-            limit=limit,
-            with_payload=True,
-            offset=next_offset,
-        )
-        for p in points:
-            b = p.payload.get("brand")
-            if b:
-                uniq.add(str(b))
-        remaining -= len(points)
-        if not next_offset or len(points) == 0:
-            break
-    return sorted(uniq)
-
-
-# -------------------- prompt --------------------
-PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template=(
-        "あなたは日英バイリンガルのサポートエンジニアです。\n"
-        "以下のコンテキストの情報のみに基づいて、簡潔かつ正確に回答してください。\n"
-        "もし答えが見つからない場合は、その旨を述べてエスカレーションを促してください。\n\n"
-        "ルール:\n"
-        "- 回答内に**ソースのブランド名**を入れること。\n"
-        "- 適切な場合は番号付き手順を使うこと。\n"
-        "- バージョン差異・リスクがあれば注意書きを入れること。\n"
-        "- 最後に (brand, qa_id, resolved_at, ticket_number) を列挙すること。\n\n"
-        "—— コンテキスト ——\n{context}\n—— コンテキストここまで ——\n\n"
-        "質問: {question}\n"
-        "回答:"
-    )
-)
-
-
-# -------------------- app --------------------
-def main():
-    st.set_page_config(page_title="全ブランドRAGサポート", page_icon="💬", layout="wide")
-    st.title("全ブランド サポートRAG 💬")
-
-    # サイドバー（環境変数の簡易表示）
-    with st.sidebar:
-        st.markdown("### 🔧 接続ヘルスチェック")
-        oa = os.getenv("OPENAI_API_KEY", "")
-        an = os.getenv("ANTHROPIC_API_KEY", "")
-        qurl = os.getenv("QDRANT_URL", "")
-        qkey = os.getenv("QDRANT_API_KEY", "")
-        qcol = os.getenv("QDRANT_COLLECTION", "support_logs_all")
-
-        st.code(
-            f"""OPENAI_API_KEY      = {oa[:4]}…{oa[-4:] if oa else ''}
-ANTHROPIC_API_KEY   = {an[:4]}…{an[-4:] if an else ''}
-QDRANT_URL          = {qurl}
-QDRANT_COLLECTION   = {qcol}
-""",
-            language="bash",
-        )
-
-    # 必須ENV
-    openai_key = need_env("OPENAI_API_KEY")
-    anthropic_key = need_env("ANTHROPIC_API_KEY")
-    qdrant_url = need_env("QDRANT_URL")
-    qdrant_key = need_env("QDRANT_API_KEY")
-    collection = os.getenv("QDRANT_COLLECTION", "support_logs_all")
-
-    # クライアント・ベクターストア
-    qclient = QdrantClient(url=qdrant_url, api_key=qdrant_key)
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai_key)
-    vectordb = QdrantVS(client=qclient, collection_name=collection, embeddings=embeddings)
-    retriever = vectordb.as_retriever(search_kwargs={"k": 5})
-
-    with st.sidebar:
-        render_health(qclient, collection)
-
-    # オプション
-    with st.expander("オプション / Options", expanded=True):
-        brand_options = ["（すべて）"] + fetch_brand_options(qclient, collection, max_scan=300)
-        sel_brand = st.selectbox("ブランドで絞り込み", brand_options, index=0)
-        k = st.slider("Top-K（取得件数）", 1, 10, 5)
-        temperature = st.slider("温度（多様性）", 0.0, 1.0, 0.2, 0.1)
-        show_debug = st.checkbox("デバッグ: メタデータを表示", value=False)
-
-    if sel_brand and sel_brand != "（すべて）":
-        retriever.search_kwargs["filter"] = Filter(
-            must=[FieldCondition(key="brand", match=MatchValue(value=sel_brand))]
+def build_prompt(lang: str = "ja") -> PromptTemplate:
+    if lang == "en":
+        template = (
+            "You are a concise bilingual (Japanese/English) support engineer.\n"
+            "Answer ONLY from the context below. If the answer is not present, say so and ask to escalate.\n\n"
+            "Rules:\n"
+            "- Include the source brand name in the answer if available.\n"
+            "- Use numbered steps where helpful.\n"
+            "- Add notes for risks/version differences if relevant.\n\n"
+            "—— Context ——\n{context}\n—— End Context ——\n\n"
+            "Question: {question}\n"
+            "Answer:"
         )
     else:
-        retriever.search_kwargs.pop("filter", None)
+        template = (
+            "あなたは簡潔な日英バイリンガルのサポートエンジニアです。\n"
+            "以下のコンテキストに含まれる情報のみで回答してください。見つからない場合はその旨を伝え、エスカレーションを促してください。\n\n"
+            "ルール:\n"
+            "- 可能であれば回答内に**ブランド名**を含める。\n"
+            "- 必要に応じて番号付き手順を使う。\n"
+            "- リスクやバージョン差異の注意点があれば追記する。\n\n"
+            "—— コンテキスト ——\n{context}\n—— コンテキストここまで ——\n\n"
+            "質問: {question}\n"
+            "回答:"
+        )
+    return PromptTemplate(input_variables=["context", "question"], template=template)
 
-    query = st.text_input("質問", placeholder="例: Cegidがフリーズした時の対処は？")
-    ask = st.button("実行（Ask）")
 
-    if not ask or not query.strip():
-        return
+def connect_qdrant() -> tuple[QdrantClient, str, OpenAIEmbeddings]:
+    q_url = getenv_or_fail("QDRANT_URL")
+    q_key = getenv_or_fail("QDRANT_API_KEY")
+    collection = getenv_or_fail("QDRANT_COLLECTION")
+    oai_key = getenv_or_fail("OPENAI_API_KEY")
 
-    # 取得
+    embeddings = OpenAIEmbeddings(api_key=oai_key, model="text-embedding-3-small")
+    client = QdrantClient(url=q_url, api_key=q_key)
+    return client, collection, embeddings
+
+
+def make_vectorstore(client: QdrantClient, collection: str, embeddings: OpenAIEmbeddings) -> LCQdrant:
+    return LCQdrant(
+        client=client,
+        collection_name=collection,
+        embeddings=embeddings,
+    )
+
+
+def get_all_brands(client: QdrantClient, collection: str, sample: int = 1000) -> List[str]:
+    """
+    Pulls up to `sample` points and extracts distinct non-empty 'brand' payload values.
+    """
+    seen = set()
+    next_offset = None
+    fetched = 0
+
+    while fetched < sample:
+        points, next_offset = client.scroll(
+            collection_name=collection,
+            with_payload=True,
+            limit=min(256, sample - fetched),
+            offset=next_offset,
+        )
+        if not points:
+            break
+        for p in points:
+            payload = p.payload or {}
+            brand = payload.get("brand")
+            if brand and isinstance(brand, str):
+                seen.add(brand.strip())
+        fetched += len(points)
+        if next_offset is None:
+            break
+
+    return sorted(seen, key=lambda x: x.lower())
+
+
+def build_filter(brand: Optional[str]) -> Optional[Filter]:
+    if not brand or brand == "（すべてのブランド）" or brand == "(All brands)":
+        return None
+    # Match on payload.key == value
+    return Filter(must=[FieldCondition(key="brand", match=MatchValue(value=brand))])
+
+
+def retrieve(
+    vs: LCQdrant,
+    query: str,
+    k: int,
+    brand: Optional[str] = None,
+) -> List[Document]:
+    flt = build_filter(brand)
+    # Use vectorstore API directly to keep control
+    if flt is None:
+        docs = vs.similarity_search(query, k=k)
+    else:
+        docs = vs.similarity_search(query, k=k, filter=flt)
+    # Ensure page_content is never None to satisfy pydantic
+    fixed: List[Document] = []
+    for d in docs:
+        text = doc_text(d)
+        if not text:
+            # force a minimal non-empty text to avoid validation error
+            p = get_payload(d)
+            text = p.get("answer") or p.get("question") or "（内容なし / no content）"
+        fixed.append(Document(page_content=text, metadata=d.metadata))
+    return fixed
+
+
+def run_llm(
+    question: str,
+    context: str,
+    temperature: float,
+    lang: str = "ja",
+) -> str:
+    anthropic_key = getenv_or_fail("ANTHROPIC_API_KEY")
+    llm = ChatAnthropic(api_key=anthropic_key, model="claude-3-5-sonnet-20241022", temperature=temperature)
+    prompt = build_prompt(lang=lang)
+    chain = prompt | llm
+    out = chain.invoke({"context": context, "question": question})
+    # langchain_anthropic outputs a BaseMessage; get .content (str | list[dict])
+    if hasattr(out, "content"):
+        return out.content if isinstance(out.content, str) else str(out.content)
+    return str(out)
+
+
+# ---------------------------
+# Streamlit UI
+# ---------------------------
+
+def main():
+    st.set_page_config(page_title="Support RAG Chat", page_icon="💬", layout="wide")
+
+    # Language toggle
+    lang = st.sidebar.radio("Language / 言語", options=["日本語 (JA)", "English (EN)"], index=0)
+    is_ja = (lang == "日本語 (JA)")
+    L = {
+        "title": "サポートRAGチャット" if is_ja else "Support RAG Chat",
+        "ask": "質問を入力してください…" if is_ja else "Type your question…",
+        "brand": "ブランド" if is_ja else "Brand",
+        "brand_all": "（すべてのブランド）" if is_ja else "(All brands)",
+        "topk": "Top-K（取得件数）" if is_ja else "Top-K (results)",
+        "temp": "温度（創造性）" if is_ja else "Temperature (creativity)",
+        "btn": "送信" if is_ja else "Send",
+        "evidence": "エビデンス（Evidence）" if is_ja else "Evidence",
+        "snippet": "スニペット" if is_ja else "Snippet",
+        "citations": "引用（Citations）" if is_ja else "Citations",
+        "health": "接続ヘルスチェック" if is_ja else "Health Check",
+        "connected": "Qdrantに接続しました。" if is_ja else "Connected to Qdrant.",
+        "not_connected": "Qdrant接続に失敗しました。" if is_ja else "Failed to connect to Qdrant.",
+        "answer": "回答（Answer）" if is_ja else "Answer",
+        "debug": "デバッグ表示" if is_ja else "Show Debug",
+    }
+
+    st.title(f"💬 {L['title']}")
+
+    # Controls
+    with st.sidebar:
+        show_debug = st.checkbox(L["debug"], value=False)
+        topk = st.slider(L["topk"], min_value=1, max_value=8, value=5, step=1)
+        temperature = st.slider(L["temp"], min_value=0.0, max_value=1.0, value=0.2, step=0.05)
+
+    # Health check + client init
     try:
-        retriever.search_kwargs["k"] = k
-        candidates = retriever.get_relevant_documents(query)
+        client, collection, embeddings = connect_qdrant()
+        st.sidebar.success(f"{L['connected']} ({collection})")
     except Exception as e:
-        st.error(f"検索中にエラーが発生しました。\n\n{e}")
+        st.sidebar.error(f"{L['not_connected']} - {e}")
+        st.stop()
+
+    # Vector store
+    vs = make_vectorstore(client, collection, embeddings)
+
+    # Brand picker (from live collection)
+    try:
+        brands = get_all_brands(client, collection, sample=1000)
+    except Exception:
+        brands = []
+
+    brands_opts = [L["brand_all"]] + brands if brands else [L["brand_all"]]
+    brand = st.selectbox(L["brand"], options=brands_opts, index=0)
+
+    # Query box
+    query = st.text_input(L["ask"], value="")
+    submit = st.button(L["btn"], type="primary")
+
+    # Health check expander
+    with st.expander(L["health"]):
+        st.write("OPENAI_API_KEY =", "set" if os.getenv("OPENAI_API_KEY") else "missing")
+        st.write("ANTHROPIC_API_KEY =", "set" if os.getenv("ANTHROPIC_API_KEY") else "missing")
+        st.write("QDRANT_URL =", os.getenv("QDRANT_URL"))
+        st.write("QDRANT_COLLECTION =", os.getenv("QDRANT_COLLECTION"))
+        # quick collection probe
+        try:
+            info = client.get_collection(collection)
+            st.write("Collection status:", getattr(info, "status", "ok"))
+        except Exception as e:
+            st.write("Collection check error:", str(e))
+
+    if not submit or not query.strip():
         return
 
-    # page_content が空のものは除外（安全策）
-    usable = [d for d in candidates if doc_text(d)]
-    if not usable:
-        st.warning("該当ドキュメントが見つかりません。")
+    # Retrieve documents
+    try:
+        candidates = retrieve(vs, query.strip(), k=topk, brand=None if brand == L["brand_all"] else brand)
+    except Exception as e:
+        st.error("Error during retrieval.")
+        if show_debug:
+            st.exception(e)
         return
 
-    # ========= エビデンス =========
-    st.markdown("### エビデンス（Evidence）")
+    # Evidence + build context
+    st.markdown(f"### {L['evidence']}")
     citations: List[str] = []
     context_blocks: List[str] = []
 
-    for i, d in enumerate(usable, 1):
-        md_all = collect_metadata(d)
+    for i, d in enumerate(candidates, 1):
+        payload = get_payload(d)
 
-        brand = meta_get(md_all, ["brand"])
-        qa_id = meta_get(md_all, ["qa_id"])
-        resolved = meta_get(md_all, ["resolved_at", "resolvedAt"])
-        ticket = meta_get(md_all, ["ticket_number", "ticket"])
+        brand_val = payload.get("brand", "N/A")
+        qa_id = payload.get("qa_id", "N/A")
+        resolved = payload.get("resolved_at", "N/A")
+        ticket = payload.get("ticket_number", "N/A")
 
-        citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
+        # Store citation tuple
+        citations.append(f"({brand_val}, {qa_id}, {resolved}, {ticket})")
 
-        st.markdown(f"**{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
-        with st.expander(f"スニペット {i}", expanded=False):
+        st.markdown(f"**{i}. brand={brand_val}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
+        with st.expander(f"{L['snippet']} {i}", expanded=False):
             st.write(doc_text(d))
             if show_debug:
-                st.caption("↓ メタデータ（実際の構造）")
                 st.json(d.metadata)
 
         context_blocks.append(
-            f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
+            f"[brand={brand_val} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
         )
 
-    context = "\n\n---\n\n".join(context_blocks)
-    citations_text = "\n".join(citations)
+    # Compose context for LLM
+    full_context = "\n\n----\n\n".join(context_blocks)
 
-    # モデル
-    llm = ChatAnthropic(model="claude-3-5-haiku-20241022", temperature=temperature, api_key=anthropic_key)
-    chain = LLMChain(llm=llm, prompt=PROMPT)
+    # Run LLM
+    try:
+        answer = run_llm(
+            question=query.strip(),
+            context=full_context,
+            temperature=temperature,
+            lang="ja" if is_ja else "en",
+        )
+    except Exception as e:
+        st.error("LLM 呼び出しでエラーが発生しました。" if is_ja else "Error while calling the LLM.")
+        if show_debug:
+            st.exception(e)
+        return
 
-    with st.spinner("生成中… / Thinking…"):
-        answer = chain.run({"context": context, "question": query})
-
-    st.markdown("### 回答（Answer）")
+    # Render answer
+    st.markdown(f"### {L['answer']}")
     st.write(answer)
 
-    st.markdown("### 引用（Citations）")
-    st.text(citations_text)
+    # Citations
+    st.markdown(f"### {L['citations']}")
+    if citations:
+        for c in citations:
+            st.write(c)
+    else:
+        st.write("(なし)" if is_ja else "(none)")
+
+    # Optional debug
+    if show_debug:
+        st.caption("— debug —")
+        dbg = [{"payload": get_payload(d), "page_content_len": len(doc_text(d))} for d in candidates]
+        st.json(dbg)
 
 
 if __name__ == "__main__":
