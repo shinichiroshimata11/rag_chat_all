@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Streamlit RAG Chatbot (Qdrant + OpenAI + Anthropic)
-- Remote Qdrant collection with metadata filter on "brand"
-- OpenAI text-embedding-3-small
-- Anthropic Claude for generation
-- Shows evidence with brand + citations
+Streamlit RAG Chatbot for all brands (Qdrant + OpenAI embeddings + Anthropic for answers).
+- Assumes Qdrant payload has "page_content" with the answer text (see upload_to_qdrant.py).
 """
 
 import os
-from typing import Optional, Dict, Any, List
+from typing import List, Dict, Any
 
-import pandas as pd
 import streamlit as st
-
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
-
-from langchain_community.vectorstores import Qdrant as LCQdrant
 from langchain_openai import OpenAIEmbeddings
 from langchain_anthropic import ChatAnthropic
 from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
+from langchain.chains import LLMChain
+from langchain_community.vectorstores import Qdrant as QdrantVS
+from qdrant_client import QdrantClient
 
 
-# -----------------------
-# Config & Constants
-# -----------------------
-APP_TITLE = "All-brands RAG Chat (Claude + Qdrant)"
-DEFAULT_TOPK = 5
-DEFAULT_TEMPERATURE = 0.0
+# ---------- helpers ----------
+def need_env(var: str):
+    val = os.getenv(var)
+    if not val:
+        raise RuntimeError(f"Please set {var} first.")
+    return val
 
-# Default Anthropic models you likely have:
-ANTHROPIC_MODELS = [
-    "claude-3-7-sonnet-20250219",  # recommended if your key has access
-    "claude-3-5-haiku-20241022",   # fast/cheap fallback
-]
 
+def doc_text(d) -> str:
+    """Robust text getter: use d.page_content; fallback to metadata."""
+    return (getattr(d, "page_content", None)
+            or d.metadata.get("page_content")
+            or d.metadata.get("answer")
+            or "")
+
+
+def mget(md: Dict[str, Any], key: str, default: str = "") -> str:
+    v = md.get(key)
+    return "" if v is None else str(v)
+
+
+def render_health(client: QdrantClient, collection: str):
+    try:
+        info = client.get_collection(collection)
+        st.success(f"Connected to Qdrant. Collection **{collection}** exists (status: {info.status}).")
+    except Exception as e:
+        st.error(f"Qdrant check failed: {e}")
+
+
+# ---------- prompt ----------
 PROMPT = PromptTemplate(
     input_variables=["context", "question"],
     template=(
@@ -55,224 +65,111 @@ PROMPT = PromptTemplate(
 )
 
 
-# -----------------------
-# Helpers
-# -----------------------
-def mask(s: Optional[str], keep: int = 6) -> str:
-    if not s:
-        return "(not set)"
-    if len(s) <= keep:
-        return s
-    return s[:keep] + "…"
+# ---------- app ----------
+def main():
+    st.set_page_config(page_title="All-Brands RAG", page_icon="💬", layout="wide")
+    st.title("All-Brands Support RAG 💬")
 
+    # sidebar env preview
+    with st.sidebar:
+        st.markdown("### 🔧 RAG Health Check")
+        oa = os.getenv("OPENAI_API_KEY", "")
+        an = os.getenv("ANTHROPIC_API_KEY", "")
+        qurl = os.getenv("QDRANT_URL", "")
+        qkey = os.getenv("QDRANT_API_KEY", "")
+        qcol = os.getenv("QDRANT_COLLECTION", "support_logs_all")
 
-def build_brand_filter(brand: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Qdrant filter dict for a single brand value (metadata key: 'brand')."""
-    if brand and brand != "All":
-        return {
-            "must": [
-                {"key": "brand", "match": {"value": brand}},
-            ]
-        }
-    return None
+        st.code(
+            f"""OPENAI_API_KEY    = {oa[:4]}…{oa[-4:] if oa else ''}
+ANTHROPIC_API_KEY = {an[:4]}…{an[-4:] if an else ''}
+QDRANT_URL        = {qurl}
+QDRANT_COLLECTION = {qcol}
+""",
+            language="bash",
+        )
 
+    # hard fail if API keys missing (so the app doesn't spin forever)
+    openai_key = need_env("OPENAI_API_KEY")
+    anthropic_key = need_env("ANTHROPIC_API_KEY")
+    qdrant_url = need_env("QDRANT_URL")
+    qdrant_key = need_env("QDRANT_API_KEY")
+    collection = os.getenv("QDRANT_COLLECTION", "support_logs_all")
 
-def load_retriever(
-    client: QdrantClient,
-    collection: str,
-    k: int = 5,
-    brand: Optional[str] = None,
-):
-    """Create a LangChain retriever backed by Qdrant."""
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vs = LCQdrant(
-        client=client,
+    # clients
+    qclient = QdrantClient(url=qdrant_url, api_key=qdrant_key)
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai_key)
+
+    # Vector store: we rely on default content_payload_key="page_content"
+    vectordb = QdrantVS(
+        client=qclient,
         collection_name=collection,
         embeddings=embeddings,
     )
+    retriever = vectordb.as_retriever(search_kwargs={"k": 5})
 
-    flt = build_brand_filter(brand)
-    if flt:
-        return vs.as_retriever(search_kwargs={"k": k, "filter": flt})
-    return vs.as_retriever(search_kwargs={"k": k})
-
-
-def qdrant_health_panel(client: QdrantClient, coll: str):
-    """Robust Qdrant health check that works across client versions."""
-    st.subheader("🔧 RAG Health Check")
-
-    # Show env summary (masked)
-    env_rows = [
-        ("OPENAI_API_KEY", mask(os.getenv("OPENAI_API_KEY"))),
-        ("ANTHROPIC_API_KEY", mask(os.getenv("ANTHROPIC_API_KEY"))),
-        ("QDRANT_URL", os.getenv("QDRANT_URL") or "(not set)"),
-        ("QDRANT_API_KEY", mask(os.getenv("QDRANT_API_KEY"))),
-        ("QDRANT_COLLECTION", coll),
-    ]
-    df = pd.DataFrame(env_rows, columns=["Variable", "Value"])
-    st.dataframe(df, hide_index=True, use_container_width=True)
-
-    st.markdown("**Qdrant Connectivity**")
-    try:
-        info = client.get_collection(coll)  # models.CollectionInfo
-        st.success(f"Connected to Qdrant. Collection **{coll}** exists.")
-
-        # points count (safe)
-        try:
-            cnt = client.count(coll).count
-            st.caption(f"Points in collection: {cnt}")
-        except Exception as e_cnt:
-            st.warning(f"Could not read points count: {e_cnt}")
-
-        # Robust vector params (single or multi vector)
-        try:
-            vp = info.config.params.vectors
-            details = ""
-            # Case 1: single VectorParams (has .size)
-            if hasattr(vp, "size"):
-                dist = getattr(vp, "distance", None)
-                details = f"Vector size={vp.size}" + (f", distance={dist}" if dist else "")
-            # Case 2: multi-vector dict
-            elif isinstance(vp, dict) and len(vp) > 0:
-                name, v = next(iter(vp.items()))
-                dist = getattr(v, "distance", None)
-                details = f"Vector '{name}': size={v.size}" + (f", distance={dist}" if dist else "")
-            # Case 3: fallback .config list
-            elif hasattr(vp, "config"):
-                cfg = vp.config[0] if isinstance(vp.config, (list, tuple)) and vp.config else vp.config
-                dist = getattr(cfg, "distance", None)
-                size = getattr(cfg, "size", None)
-                details = f"Vector size={size}" + (f", distance={dist}" if dist else "")
-
-            if details:
-                st.caption(details)
-        except Exception as e_vec:
-            st.warning(f"Could not parse vector params: {e_vec}")
-
-    except Exception as e:
-        st.error("❌ Qdrant connection/collection check failed.")
-        st.exception(e)
-
-
-# -----------------------
-# Streamlit App
-# -----------------------
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-
-    # --- Env / Qdrant setup
-    QDRANT_URL = os.getenv("QDRANT_URL")
-    QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-    COLLECTION = os.getenv("QDRANT_COLLECTION", "support_logs_all")
-
-    if not QDRANT_URL or not QDRANT_API_KEY:
-        st.error("Please set QDRANT_URL and QDRANT_API_KEY.")
-        st.stop()
-
-    # Create Qdrant client (use HTTP; remote cluster)
-    client = QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
-        prefer_grpc=False,  # keep False for Streamlit Cloud (HTTP works everywhere)
-        timeout=60,
-    )
-
-    # --- Sidebar Controls
     with st.sidebar:
-        st.header("Settings")
-        # Brand list is dynamic: fetch distinct brands? Quick way is a free-text + 'All'.
-        brand = st.selectbox("Brand filter", ["All"], index=0, help="If your data was uploaded with 'brand' payloads, this filter restricts retrieval.")
-        topk = st.slider("Top-K documents", 2, 12, DEFAULT_TOPK, 1)
-        temperature = st.slider("Temperature", 0.0, 1.0, DEFAULT_TEMPERATURE, 0.1)
-        model = st.selectbox("Claude model", ANTHROPIC_MODELS, index=0)
+        render_health(qclient, collection)
 
-        st.markdown("---")
-        if st.checkbox("Show RAG health panel", value=True):
-            qdrant_health_panel(client, COLLECTION)
+    # UI controls
+    with st.expander("Options", expanded=False):
+        k = st.slider("Top-K", 1, 10, 5)
+        temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
 
-    # --- LLM
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        st.error("Please set ANTHROPIC_API_KEY.")
-        st.stop()
+    query = st.text_input("質問 / Question", placeholder="例: Cegidがフリーズした時の対処は？")
+    ask = st.button("Ask")
 
-    llm = ChatAnthropic(model=model, temperature=temperature)
+    if not ask or not query.strip():
+        return
 
-    # --- Retriever
+    # retrieve (defensive against any weird documents)
     try:
-        retriever = load_retriever(client, collection=COLLECTION, k=topk, brand=brand)
+        retriever.search_kwargs["k"] = k
+        candidates = retriever.get_relevant_documents(query)
     except Exception as e:
-        st.error("Failed to initialize retriever from Qdrant.")
-        st.exception(e)
-        st.stop()
+        st.error(f"Error during retrieval.\n\n{e}")
+        return
 
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=True,
-    )
+    # Build context and evidence safely
+    usable = [
+        d for d in candidates
+        if doc_text(d)  # must have text
+    ]
+    if not usable:
+        st.warning("No relevant documents found.")
+        return
 
-    # --- UI
-    query = st.text_input("Ask a question")
-    go = st.button("Ask")
+    # Evidence panel
+    st.markdown("### Evidence")
+    for i, d in enumerate(usable, 1):
+        brand = mget(d.metadata, "brand", "N/A")
+        qa_id = mget(d.metadata, "qa_id", "N/A")
+        resolved = mget(d.metadata, "resolved_at", "N/A")
+        ticket = mget(d.metadata, "ticket_number", "N/A")
+        st.write(f"{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}")
+        with st.expander(f"Snippet {i}", expanded=False):
+            st.write(doc_text(d))
 
-    if go and query.strip():
-        with st.spinner("Searching and composing…"):
-            # Get candidates first (for visibility)
-            try:
-                candidates = retriever.get_relevant_documents(query)
-            except Exception as e:
-                st.error("Error during retrieval.")
-                st.exception(e)
-                st.stop()
+    context_blocks = []
+    for d in usable:
+        brand = mget(d.metadata, "brand")
+        qa_id = mget(d.metadata, "qa_id")
+        resolved = mget(d.metadata, "resolved_at")
+        ticket = mget(d.metadata, "ticket_number")
+        context_blocks.append(
+            f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
+        )
+    context = "\n\n---\n\n".join(context_blocks)
 
-            st.subheader("Evidence")
-            if candidates:
-                for i, d in enumerate(candidates, 1):
-                    m = d.metadata or {}
-                    st.markdown(
-                        f"- **{i}.** brand=`{m.get('brand','')}`, "
-                        f"qa_id=`{m.get('qa_id','')}`, "
-                        f"resolved_at=`{m.get('resolved_at','')}`, "
-                        f"ticket=`{m.get('ticket_number','')}`"
-                    )
-            else:
-                st.caption("No candidate chunks returned.")
+    # LLM
+    llm = ChatAnthropic(model="claude-3-5-haiku-20241022", temperature=temperature, api_key=anthropic_key)
+    chain = LLMChain(llm=llm, prompt=PROMPT)
 
-            # Run the QA chain
-            try:
-                result = chain.invoke({"query": query})
-                answer = result["result"]
-                docs: List[Any] = result.get("source_documents", [])
-            except Exception as e:
-                st.error("Generation failed.")
-                st.exception(e)
-                st.stop()
+    with st.spinner("Thinking…"):
+        answer = chain.run({"context": context, "question": query})
 
-        st.subheader("Answer")
-        st.write(answer)
-
-        # Build citation footer (brand, qa_id, resolved_at, ticket_number)
-        if docs:
-            st.markdown("**Citations:**")
-            lines = []
-            for d in docs:
-                m = d.metadata or {}
-                lines.append(
-                    f"- ({m.get('brand','')}, {m.get('qa_id','')}, "
-                    f"{m.get('resolved_at','')}, {m.get('ticket_number','')})"
-                )
-            st.write("\n".join(lines))
+    st.markdown("### Answer")
+    st.write(answer)
 
 
 if __name__ == "__main__":
-    # Minimal guards for local runs
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("Please set OPENAI_API_KEY.")
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise RuntimeError("Please set ANTHROPIC_API_KEY.")
-    if not os.getenv("QDRANT_URL") or not os.getenv("QDRANT_API_KEY"):
-        raise RuntimeError("Please set QDRANT_URL and QDRANT_API_KEY.")
     main()
