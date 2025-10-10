@@ -58,7 +58,6 @@ def collect_metadata(doc) -> Dict[str, Any]:
     # 1) まず doc.metadata 自体
     if hasattr(doc, "metadata") and isinstance(doc.metadata, dict):
         md.update(_flatten_dict(doc.metadata))
-
         # 2) よくあるネスト候補を順に統合
         for k in ("payload", "qdrant__payload", "document", "metadata", "data"):
             if k in doc.metadata and isinstance(doc.metadata[k], dict):
@@ -80,7 +79,7 @@ def collect_metadata(doc) -> Dict[str, Any]:
 def doc_text(doc) -> str:
     """
     本文テキストを安全に抽出。
-    優先: doc.page_content -> payload.page_content -> payload.answer -> "".
+    優先: doc.page_content -> payload.page_content/text/answer -> question+answer -> "".
     """
     # 1) page_content が入っていれば最優先
     if getattr(doc, "page_content", None):
@@ -226,6 +225,7 @@ QDRANT_COLLECTION   = {qcol}
         st.error(f"検索中にエラーが発生しました。\n\n{e}")
         return
 
+    # page_content が空のものは除外（安全策）
     usable = [d for d in candidates if doc_text(d)]
     if not usable:
         st.warning("該当ドキュメントが見つかりません。")
@@ -237,32 +237,25 @@ QDRANT_COLLECTION   = {qcol}
     context_blocks: List[str] = []
 
     for i, d in enumerate(usable, 1):
-    # ✅ Extract metadata directly from payload first (Qdrant format)
-    md_all = {}
-    if hasattr(d, "metadata") and isinstance(d.metadata, dict):
-        md_all.update(d.metadata.get("payload", {}))  # Qdrant payload
-        md_all.update(d.metadata)  # fallback (in case keys exist at top-level)
+        md_all = collect_metadata(d)
 
-    # ✅ Extract values with safe defaults
-    brand = md_all.get("brand", "N/A")
-    qa_id = md_all.get("qa_id", "N/A")
-    resolved = md_all.get("resolved_at", "N/A")
-    ticket = md_all.get("ticket_number", "N/A")
+        brand = meta_get(md_all, ["brand"])
+        qa_id = meta_get(md_all, ["qa_id"])
+        resolved = meta_get(md_all, ["resolved_at", "resolvedAt"])
+        ticket = meta_get(md_all, ["ticket_number", "ticket"])
 
-    citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
+        citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
 
-    # ✅ Display
-    st.markdown(f"**{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
-    with st.expander(f"スニペット {i}", expanded=False):
-        st.write(doc_text(d))
-        if show_debug:
-            st.caption("↓ メタデータ（実際の構造）")
-            st.json(d.metadata)
+        st.markdown(f"**{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
+        with st.expander(f"スニペット {i}", expanded=False):
+            st.write(doc_text(d))
+            if show_debug:
+                st.caption("↓ メタデータ（実際の構造）")
+                st.json(d.metadata)
 
-    context_blocks.append(
-        f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
-    )
-
+        context_blocks.append(
+            f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
+        )
 
     context = "\n\n---\n\n".join(context_blocks)
     citations_text = "\n".join(citations)
