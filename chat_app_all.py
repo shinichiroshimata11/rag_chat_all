@@ -4,11 +4,11 @@
 All-Brands RAG Chatbot (Qdrant + OpenAI embeddings + Anthropic)
 - 日本語UI
 - ブランド絞り込みドロップダウン
-- Qdrantのpayloadには page_content（本文）/ brand / qa_id / resolved_at / ticket_number が入っている想定
+- 頑健なメタデータ抽出（brand / qa_id / resolved_at / ticket_number）
 """
 
 import os
-from typing import List, Dict, Any, Set
+from typing import Any, Dict, Iterable, List, Set
 
 import streamlit as st
 from langchain_openai import OpenAIEmbeddings
@@ -28,24 +28,84 @@ def need_env(var: str) -> str:
     return val
 
 
-def doc_text(d) -> str:
-    """安全にテキストを取得（page_content優先、無ければmetadata経由）"""
-    return (getattr(d, "page_content", None)
-            or d.metadata.get("page_content")
-            or d.metadata.get("answer")
-            or "")
+def _flatten_dict(d: Dict[str, Any], depth: int = 2) -> Dict[str, Any]:
+    """
+    小さい深さでネスト辞書を平坦化する。キー衝突は上書きOK。
+    例: {'payload': {...}, 'qdrant__payload': {...}} を一つにまとめる。
+    """
+    out: Dict[str, Any] = {}
+    if not isinstance(d, dict):
+        return out
+    stack: List[tuple[Dict[str, Any], int]] = [(d, 0)]
+    while stack:
+        cur, lvl = stack.pop()
+        for k, v in cur.items():
+            if isinstance(v, dict) and lvl < depth:
+                stack.append((v, lvl + 1))
+            else:
+                if v is not None:
+                    out[k] = v
+    return out
 
 
-def mget(md: Dict[str, Any], key: str, default: str = "") -> str:
-    v = md.get(key)
-    return default if v is None else str(v)
+def collect_metadata(doc) -> Dict[str, Any]:
+    """
+    LangChainのDocument.metadataの中に、実際のQdrant payloadが
+    いろいろなキーで入る場合に対応（'payload', 'qdrant__payload', 'document' など）。
+    """
+    md: Dict[str, Any] = {}
+
+    # 1) まず doc.metadata 自体
+    if hasattr(doc, "metadata") and isinstance(doc.metadata, dict):
+        md.update(_flatten_dict(doc.metadata))
+
+        # 2) よくあるネスト候補を順に統合
+        for k in ("payload", "qdrant__payload", "document", "metadata", "data"):
+            if k in doc.metadata and isinstance(doc.metadata[k], dict):
+                md.update(_flatten_dict(doc.metadata[k]))
+
+    # 3) 念のため doc.dict() 内も見る（実装差異への保険）
+    try:
+        as_dict = getattr(doc, "dict", None)
+        if callable(as_dict):
+            d_all = doc.dict()
+            if "metadata" in d_all and isinstance(d_all["metadata"], dict):
+                md.update(_flatten_dict(d_all["metadata"]))
+    except Exception:
+        pass
+
+    return md
 
 
-def meta_get(md: dict, keys: list[str], default="N/A") -> str:
-    """複数キー候補から値を取得"""
-    for k in keys:
-        if md.get(k):
-            return str(md[k])
+def doc_text(doc) -> str:
+    """
+    本文テキストを安全に抽出。
+    優先: doc.page_content -> payload.page_content -> payload.answer -> "".
+    """
+    # 1) page_content が入っていれば最優先
+    if getattr(doc, "page_content", None):
+        return doc.page_content
+
+    # 2) メタデータから拾う
+    md = collect_metadata(doc)
+    for key in ("page_content", "text", "answer", "content", "body"):
+        if md.get(key):
+            return str(md[key])
+
+    # 3) 最後の保険：question + answer の連結（両方あれば）
+    q = md.get("question")
+    a = md.get("answer")
+    if q or a:
+        return f"Q: {q or ''}\nA: {a or ''}".strip()
+
+    return ""
+
+
+def meta_get(md: Dict[str, Any], candidates: Iterable[str], default: str = "N/A") -> str:
+    for k in candidates:
+        v = md.get(k)
+        if v not in (None, "", "null", "None"):
+            return str(v)
     return default
 
 
@@ -103,7 +163,7 @@ def main():
     st.set_page_config(page_title="全ブランドRAGサポート", page_icon="💬", layout="wide")
     st.title("全ブランド サポートRAG 💬")
 
-    # サイドバー
+    # サイドバー（環境変数の簡易表示）
     with st.sidebar:
         st.markdown("### 🔧 接続ヘルスチェック")
         oa = os.getenv("OPENAI_API_KEY", "")
@@ -121,17 +181,16 @@ QDRANT_COLLECTION   = {qcol}
             language="bash",
         )
 
-    # 環境変数取得
+    # 必須ENV
     openai_key = need_env("OPENAI_API_KEY")
     anthropic_key = need_env("ANTHROPIC_API_KEY")
     qdrant_url = need_env("QDRANT_URL")
     qdrant_key = need_env("QDRANT_API_KEY")
     collection = os.getenv("QDRANT_COLLECTION", "support_logs_all")
 
-    # クライアント
+    # クライアント・ベクターストア
     qclient = QdrantClient(url=qdrant_url, api_key=qdrant_key)
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai_key)
-
     vectordb = QdrantVS(client=qclient, collection_name=collection, embeddings=embeddings)
     retriever = vectordb.as_retriever(search_kwargs={"k": 5})
 
@@ -144,6 +203,7 @@ QDRANT_COLLECTION   = {qcol}
         sel_brand = st.selectbox("ブランドで絞り込み", brand_options, index=0)
         k = st.slider("Top-K（取得件数）", 1, 10, 5)
         temperature = st.slider("温度（多様性）", 0.0, 1.0, 0.2, 0.1)
+        show_debug = st.checkbox("デバッグ: メタデータを表示", value=False)
 
     if sel_brand and sel_brand != "（すべて）":
         retriever.search_kwargs["filter"] = Filter(
@@ -158,7 +218,7 @@ QDRANT_COLLECTION   = {qcol}
     if not ask or not query.strip():
         return
 
-    # ドキュメント取得
+    # 取得
     try:
         retriever.search_kwargs["k"] = k
         candidates = retriever.get_relevant_documents(query)
@@ -173,21 +233,29 @@ QDRANT_COLLECTION   = {qcol}
 
     # ========= エビデンス =========
     st.markdown("### エビデンス（Evidence）")
-    citations = []
-    context_blocks = []
+    citations: List[str] = []
+    context_blocks: List[str] = []
 
     for i, d in enumerate(usable, 1):
-        md = d.metadata or {}
-        brand = meta_get(md, ["brand"])
-        qa_id = meta_get(md, ["qa_id", "qaid", "qaId"])
-        resolved = meta_get(md, ["resolved_at", "resolvedAt", "date", "resolved"])
-        ticket = meta_get(md, ["ticket_number", "ticket", "ticket_no"])
+        md_all = collect_metadata(d)
+
+        brand = meta_get(md_all, ("brand",))
+        qa_id = meta_get(md_all, ("qa_id", "qaid", "qaId"))
+        resolved = meta_get(md_all, ("resolved_at", "resolvedAt", "date", "resolved"))
+        ticket = meta_get(md_all, ("ticket_number", "ticket", "ticket_no"))
+
+        # ここで N/A にならないように、question/answer から推測補完も可能（必要なら有効化）
+        # if brand == "N/A" and md_all.get("question"):
+        #     brand = "不明ブランド"
 
         citations.append(f"({brand}, {qa_id}, {resolved}, {ticket})")
 
         st.markdown(f"**{i}. brand={brand}, qa_id={qa_id}, resolved_at={resolved}, ticket={ticket}**")
         with st.expander(f"スニペット {i}", expanded=False):
             st.write(doc_text(d))
+            if show_debug:
+                st.caption("↓ メタデータ（フラット化後）")
+                st.json(md_all)
 
         context_blocks.append(
             f"[brand={brand} qa_id={qa_id} resolved_at={resolved} ticket={ticket}]\n{doc_text(d)}"
